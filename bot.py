@@ -551,7 +551,7 @@ def chat_json(system, user, models, temperature, tries=2, max_tokens=3000, plugi
 
 # ---- free evidence: Wikipedia (no API key, no cost)
 WIKI_API = "https://en.wikipedia.org/w/api.php"
-WIKI_UA = os.environ.get("WIKI_UA", "WildAnimalFactsBot/1.0 (educational animal-facts page; GitHub Actions)")
+WIKI_UA = os.environ.get("WIKI_UA", "WildloreFactsBot/1.0 (educational animal-facts page; GitHub Actions)")
 SHOW_SOURCE = os.environ.get("SHOW_SOURCE", "0") == "1"
 BANNED_TITLE = re.compile(r"^domestic|^dog$|^cat$|breed|pet food|taxidermy|zoophilia|bestiality", re.I)
 CUT_HEADINGS = re.compile(r"\n=+ *(References|See also|External links|Notes|Further reading|Bibliography|Footnotes|Sources|Citations) *=+", re.I)
@@ -1010,7 +1010,7 @@ def scrub_numbers(post, source, title):
 
 
 def add_hashtags(post):
-    tags = ["#WildAnimalFacts"]
+    tags = ["#WildloreFacts"]
     for t in post.get("hashtags") or []:
         t = "#" + re.sub(r"[^A-Za-z0-9]", "", str(t))
         if len(t) > 3 and t.lower() not in [x.lower() for x in tags]:
@@ -1171,7 +1171,7 @@ def emergency_post(title, source):
     """Last resort without any AI: a plain, attributed post from the article's own opening lines."""
     flat = re.sub(r"\s+", " ", re.sub(r"=+[^=]+=+", " ", source[:4000]))
     sents = [x for x in re.split(r"(?<=[.!?])\s+", flat) if 40 < len(x) < 320][:4]
-    caption = "\n\n".join(sents) + f'\n\nWhat part of this surprises you most?\n\nSource: Wikipedia, "{title}"\n#WildAnimalFacts #Animals'
+    caption = "\n\n".join(sents) + f'\n\nWhat part of this surprises you most?\n\nSource: Wikipedia, "{title}"\n#WildloreFacts #Animals'
     return {
         "topic": title, "source_title": title, "habitat": "",
         "headline_lines": ensure_highlight(rewrap_headline(["THE STORY OF", f"[{title.upper()}]"])),
