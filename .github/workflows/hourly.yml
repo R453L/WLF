@@ -1,1 +1,70 @@
+name: hourly-post
+
+# Triggered ONLY by cron-job.org (API call). No GitHub schedule here, so there are no double runs.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Never cancel a run that is posting; a second trigger waits in the queue.
+concurrency:
+  group: hourly-post
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate and send post
+        run: python bot.py
+        env:
+          # images: Pollinations
+          POLLINATIONS_API_KEY: ${{ secrets.POLLINATIONS_API_KEY }}
+          IMAGE_MODEL: ${{ vars.IMAGE_MODEL || 'flux,lykon/dreamshaper-8-lcm' }}
+          # text (writer, checker, image QA): pool of OpenRouter keys, one per line or comma separated
+          OPENROUTER_API_KEYS: ${{ secrets.OPENROUTER_API_KEYS }}
+          # models are chosen automatically (best FREE ones). Set these Variables only to override:
+          WRITER_MODEL: ${{ vars.WRITER_MODEL || '' }}
+          CHECKER_MODEL: ${{ vars.CHECKER_MODEL || '' }}
+          IMAGE_QA_MODEL: ${{ vars.IMAGE_QA_MODEL || '' }}
+          PREFER_MODELS: ${{ vars.PREFER_MODELS || '' }}
+          # optional paid safety net, used only if every free model fails (leave empty to never spend credit)
+          PAID_FALLBACK_MODEL: ${{ vars.PAID_FALLBACK_MODEL || '' }}
+          WEB_CHECK: ${{ vars.WEB_CHECK || '0' }}
+          IMAGE_QA: ${{ vars.IMAGE_QA || '1' }}
+          # channels
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+
+      - name: Save topic history
+        shell: bash
+        run: |
+          set -e
+          git config --global user.name "pch-bot"
+          git config --global user.email "pch-bot@users.noreply.github.com"
+          git add history.json || true
+          if ! git diff --cached --quiet; then
+            git commit -m "bot: update history [skip ci]"
+            git pull --rebase origin "${GITHUB_REF_NAME:-main}" || true
+            git push origin HEAD:"${GITHUB_REF_NAME:-main}"
+          else
+            echo "No changes to commit."
+          fi
 
