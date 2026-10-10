@@ -30,7 +30,7 @@ def _models(name, default):
 WRITER_MODELS = _models("WRITER_MODEL", "")    # empty = automatic: best free models
 CHECKER_MODELS = _models("CHECKER_MODEL", "")  # empty = automatic: a different free model family
 IMAGE_MODELS = _models("IMAGE_MODEL", "lykon/dreamshaper-8-lcm,flux")  # best first; the next ones are used if it fails
-PAGE_NAME = os.environ.get("PAGE_NAME", "Wild Animal Facts")
+PAGE_NAME = os.environ.get("PAGE_NAME", "Wildlore Facts")
 SEND_NOTES = os.environ.get("SEND_NOTES", "0") == "1"
 WATERMARK = os.environ.get("WATERMARK", "AI-generated illustration")
 
