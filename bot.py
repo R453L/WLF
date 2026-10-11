@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Wild Animal Facts - post bot. Text via a pool of OpenRouter keys (round-robin), images via Pollinations."""
+"""Wildlore Facts - post bot. Text via a pool of OpenRouter keys (round-robin), images via Cloudflare Workers AI (free daily allowance), Pollinations as backup."""
 import base64
 import hashlib
 import io
@@ -20,6 +20,15 @@ from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFo
 
 API = "https://gen.pollinations.ai"
 KEY = os.environ.get("POLLINATIONS_API_KEY", "")
+# Cloudflare Workers AI (free: 10,000 neurons per day, resets 00:00 UTC). Used first when both values are set.
+CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "").strip()
+CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "").strip()
+CF_MODEL = os.environ.get("CF_MODEL", "@cf/black-forest-labs/flux-1-schnell").strip() or "@cf/black-forest-labs/flux-1-schnell"
+try:
+    CF_STEPS = min(8, max(1, int(os.environ.get("CF_STEPS", "4") or 4)))
+except ValueError:
+    CF_STEPS = 4
+CF_SIZE = os.environ.get("CF_SIZE", "").strip()   # optional, e.g. "1024x1280"; empty = the model default (square)
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 def _models(name, default):
@@ -97,7 +106,7 @@ HOOK RULE (most important after accuracy):
 
 SOURCE-GROUNDING RULES (absolute):
 - You receive SOURCE TEXT from Wikipedia. Use ONLY facts that are stated in the SOURCE TEXT. Never add a number, name, cause or "first/only/largest/fastest" claim that the SOURCE TEXT does not state. Use no outside knowledge for facts.
-- Write every number and unit EXACTLY as it appears in the SOURCE TEXT (if the source says "20 centimetres", write "20 centimetres"). Do no arithmetic and no conversions.
+- Write every number and unit EXACTLY as it appears in the SOURCE TEXT (if the source says "20 centimetres", write "20 centimetres"). Do no arithmetic and no conversions: never restate a measurement in another unit (not "24 in" as "two feet") and never add "nearly", "almost", "roughly" or "about" to a number unless the SOURCE TEXT uses that word.
 - Every proper name (species, place, scientist) in your caption must appear in the SOURCE TEXT.
 - Pick the single most surprising fact with a number that the SOURCE TEXT clearly states and that is about the animal's body, senses, behaviour, life cycle, habitat or survival. Return {"skip": true, "reason": "..."} only if the article contains no such fact at all.
 - "evidence": 3 to 6 objects {"claim": "...", "quote": "..."} where quote is copied WORD FOR WORD from the SOURCE TEXT (6 to 30 words). Together they must cover EVERY number and name used in the headline and in the REVEAL paragraph.
@@ -115,6 +124,7 @@ IMAGE RULES:
 - Give TWO different visual ideas for the same story: image_prompt_a is the main picture, image_prompt_b is another way to show the same story (for example a close-up vs a wide habitat shot). Each is ONE vivid visual description of 40-70 words: the animal and what it is doing FIRST, then the place and habitat, the light, the mood and the camera view (close-up, telephoto, wide, underwater).
 - Keep the main subject in the upper two thirds of the frame. No people, no text, no logos, no cages.
 - Show only ONE or TWO animals clearly. Avoid crowds and tangled groups.
+- Describe the species' REAL colours and body shape (for example deep-sea fish are dark brown or black with small eyes, a polar bear is creamy white). Name the species and its most recognisable feature (for example the very long thin lure of a whipnose angler). Never ask for bright rainbow colours, cute or cartoon faces, glowing outlines or fantasy looks.
 
 HEADLINE SOURCE RULE (accuracy):
 - Build the headline and the main claim ONLY from a sentence of the SOURCE TEXT whose meaning is completely clear. If a sentence is ambiguous (for example a range where it is unclear what it measures), do not use it for the headline or the main claim: pick another fact.
@@ -128,7 +138,7 @@ HEADLINE RULES:
 - The headline must be truthful and supported by the source.
 
 CAPTION RULES (write like a real person, not like an AI):
-- 150-260 words, plain American English, in the voice of ONE sharp, slightly opinionated nature nerd telling a friend something that surprised him. The user message gives you a VOICE and a SHAPE: follow them and no other template.
+- 150-260 words (count them: a caption under 150 words is rejected), plain American English, in the voice of ONE sharp, slightly opinionated nature nerd telling a friend something that surprised him. The user message gives you a VOICE and a SHAPE: follow them and no other template.
 - Start with the surprising thing itself (a number, an odd detail, what the animal does). The first sentence is under 120 characters and holds the surprising fact. Never start with "Picture", "Imagine", "In a world", "Have you ever", or a scene opener.
 - Mix very short sentences (2-6 words) with long winding ones (25+ words). Break the rhythm on purpose. Fragments are fine. Use contractions. One small aside is fine.
 - Use the odd, specific words of the SOURCE TEXT (names of body parts, prey, places, behaviours) instead of general words.
@@ -973,11 +983,11 @@ def validate_post(post, level=0):
         if not 6 <= words <= 15:
             return f"headline word count {words}"
     cwords = len(str(post.get("caption", "")).split())
-    if level == 0 and not 120 <= cwords <= 450:
+    if level == 0 and not 150 <= cwords <= 450:
         return f"caption word count {cwords}"
-    if level == 1 and cwords < 60:
+    if level == 1 and cwords < 110:
         return f"caption word count {cwords}"
-    if level == 2 and cwords < 25:
+    if level == 2 and cwords < 60:
         return f"caption word count {cwords}"
     cap = re.sub(r"\s?\[\d{1,2}\]", "", post["caption"])
     cap = re.sub(r"\s*[\u2014\u2013]\s*", ", ", cap)  # no em/en dashes (AI tell)
@@ -1260,7 +1270,7 @@ QA_MODELS = _models("IMAGE_QA_MODEL", "")      # empty = automatic: free vision 
 QA_PROMPT = (
     "You are a strict quality reviewer for AI-generated wildlife photographs. Reject the image if you see ANY of: "
     "a distorted, melted or asymmetric animal face; wrong number of legs, wings, eyes or tails for the species; "
-    "two heads or merged, duplicated animals; any human figure or visible text; impossible or fused body parts; a cartoon, anime or painted look. "
+    "two heads or merged, duplicated animals; any human figure or visible text; impossible or fused body parts; a cartoon, anime or painted look; colours or body shape that do not match the real species (for example a brightly coloured or cute-faced deep-sea fish). "
     'Return ONLY JSON: {"ok": true or false, "score": 1-10, "problems": ["..."]}. Score 8 or more only if it looks like a clean real photograph.'
 )
 _QA_OFF = [False]
@@ -1301,13 +1311,70 @@ def build_image_prompt(post, variant=0, model=None):
         return f"{_shorten(text, 38)}, {era}, {style}"[:520].lstrip(", ")
     return (f"{text.strip().rstrip('.')}. {era}. {STYLE_SUFFIX}. Vertical 4:5 frame: the main subject sits in the upper two thirds "
             "and the lowest part of the frame is a darker foreground such as grass, rock, water or soil. "
+            "True-to-life anatomy and natural colours of the real species, documentary wildlife photo, not a cartoon, no extra fins, legs or eyes. "
             "Sharp focus, natural look, fine film grain, photorealistic, high detail. No watermarks.")[:1500]
 
 
 _BAD_IMG = set()   # image models that refused us in this run (no credit, unknown model); skipped for the rest of the run
 
 
+_CF_BAD = [False]   # set when Cloudflare refuses us (wrong token, no allowance left); skipped for the rest of the run
+
+
+def _cf_candidate(post, variant):
+    """One picture from Cloudflare Workers AI. Raises RuntimeError on any problem so the caller can fall back."""
+    prompt = build_image_prompt(post, variant, "flux")[:2000]
+    body = {"prompt": prompt, "steps": CF_STEPS}
+    if CF_SIZE:
+        try:
+            w, h = CF_SIZE.lower().split("x")
+            body["width"], body["height"] = int(w), int(h)
+        except ValueError:
+            log("CF_SIZE ignored (use the form 1024x1280):", CF_SIZE)
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_MODEL}"
+    last = None
+    for i in range(2):
+        try:
+            r = requests.post(url, headers={"Authorization": f"Bearer {CF_API_TOKEN}"}, json=body, timeout=120)
+            ctype = r.headers.get("content-type", "")
+            if r.status_code == 200:
+                raw = None
+                if ctype.startswith("image/"):
+                    raw = r.content
+                else:
+                    data = r.json()
+                    b64 = (data.get("result") or {}).get("image") or data.get("image")
+                    if b64:
+                        raw = base64.b64decode(b64)
+                if raw:
+                    img = Image.open(io.BytesIO(raw)).convert("RGB")
+                    log(f"image candidate ok (Cloudflare {CF_MODEL}, {img.size[0]}x{img.size[1]}, try {i + 1})")
+                    return ImageOps.fit(img, (W, H), method=Image.LANCZOS, centering=(0.5, 0.4)), False
+            last = f"HTTP {r.status_code} {r.text[:200]}"
+            low = r.text.lower()
+            if r.status_code in (401, 403):
+                _CF_BAD[0] = True
+                raise RuntimeError(f"Cloudflare refused the token ({last[:120]}). Check CF_API_TOKEN has the Workers AI permission and CF_ACCOUNT_ID is right")
+            if "neuron" in low or "allocation" in low or "quota" in low or "daily" in low:
+                _CF_BAD[0] = True
+                raise RuntimeError(f"Cloudflare free allowance used up for today ({last[:120]})")
+        except RuntimeError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            last = e
+        log(f"cloudflare image call failed ({i + 1}/2): {str(last)[:160]}")
+        time.sleep(4 * (i + 1))
+    raise RuntimeError(f"cloudflare image failed: {str(last)[:160]}")
+
+
 def _fetch_candidate(post, variant, tag):
+    if CF_ACCOUNT_ID and CF_API_TOKEN and not _CF_BAD[0]:
+        try:
+            return _cf_candidate(post, variant)
+        except Exception as e:  # noqa: BLE001
+            log(f"Cloudflare image failed: {str(e)[:220]}; using Pollinations instead")
+    if not KEY:
+        raise RuntimeError("no image service available: Cloudflare failed and POLLINATIONS_API_KEY is not set")
     last = None
     for i in range(3):
         models = [m for m in IMAGE_MODELS if m not in _BAD_IMG] or IMAGE_MODELS
@@ -1520,7 +1587,7 @@ def overlay_text(photo, headline_lines, subhook):
         font = load_font(size)
         lh = int(size * 1.08)
         widths = [sum(font.getlength(t) for t, _ in segs) for segs in lines]
-        total = lh * len(lines) + (int(size * 0.62) if subhook.strip() else 0)
+        total = lh * len(lines) + (int(size * 0.82) if subhook.strip() else 0)
         if max(widths) <= max_w and total <= max_h:
             break
         size -= 4
@@ -1536,7 +1603,7 @@ def overlay_text(photo, headline_lines, subhook):
         y += lh
     sub = subhook.upper().strip()
     if sub:
-        _spaced(draw, W / 2, y + int(size * 0.10), sub, load_font(max(26, int(size * 0.34))), WHITE, spacing=3)
+        _spaced(draw, W / 2, y + int(size * 0.24), sub, load_font(max(26, int(size * 0.34))), WHITE, spacing=3)
 
     # watermarks: page name (bottom-left) and the AI label (bottom-right)
     if PAGE_NAME:
@@ -1612,7 +1679,7 @@ def facebook_due():
 
 # ----------------------------------------------------------------- main
 def main():
-    missing = [n for n, v in (("POLLINATIONS_API_KEY", KEY), ("TELEGRAM_BOT_TOKEN", TG_TOKEN), ("TELEGRAM_CHAT_ID", TG_CHAT),
+    missing = [n for n, v in (("POLLINATIONS_API_KEY (or CF_ACCOUNT_ID and CF_API_TOKEN)", KEY or (CF_ACCOUNT_ID and CF_API_TOKEN)), ("TELEGRAM_BOT_TOKEN", TG_TOKEN), ("TELEGRAM_CHAT_ID", TG_CHAT),
                               ("OPENROUTER_API_KEYS", ",".join(OR_KEYS))) if not v]
     if missing:
         sys.exit(f"missing env vars: {', '.join(missing)}")
