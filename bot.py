@@ -10,6 +10,7 @@ import random
 import re
 import sys
 import time
+import unicodedata
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -139,14 +140,15 @@ HEADLINE RULES:
 - The headline must be truthful and supported by the source.
 
 CAPTION RULES (write like a real person, not like an AI):
-- 150-260 words (count them: a caption under 150 words is rejected), plain American English, in the voice of ONE sharp, slightly opinionated nature nerd telling a friend something that surprised him. The user message gives you a VOICE and a SHAPE: follow them and no other template.
-- Start with the surprising thing itself (a number, an odd detail, what the animal does). The first sentence is under 120 characters and holds the surprising fact. Never start with "Picture", "Imagine", "In a world", "Have you ever", or a scene opener.
+- 150-260 words (count them: a caption under 150 words is rejected), plain American English, in the voice of ONE sharp, slightly opinionated nature nerd telling a friend about an animal that stunned him. The user message gives you a VOICE and a SHAPE: follow them and no other template.
+- Start with the surprising thing itself (an odd detail, a number, what the animal actually does). The first sentence is what Facebook shows before "See more": it must work alone, under 120 characters, and hold the surprising fact. The animal's name and where it lives (its region or habitat) must both appear within the first two sentences. Never start with "Picture", "Imagine", "Meet the", "Welcome to", "In a world", "Have you ever", or a scene-setting opener.
 - Mix very short sentences (2-6 words) with long winding ones (25+ words). Break the rhythm on purpose. Fragments are fine. Use contractions. One small aside is fine.
-- Use the odd, specific words of the SOURCE TEXT (names of body parts, prey, places, behaviours) instead of general words.
-- Never write vague summary lines such as "marked a turning point", "played a crucial role", "paved the way", "highlighting", "underscores", "a testament to", "nature's wonder". Never use the words: delve, tapestry, testament, realm, pivotal, crucial, moreover, furthermore, additionally, notably, ultimately; never write "it's worth noting", "in conclusion", "not just ... but", "Here's the thing".
-- No lists of three adjectives or three parallel clauses. No moral, no summary, no lesson at the end.
+- Use the odd, specific words of the SOURCE TEXT (names of body parts, prey, places, behaviours) instead of general words. Say what the animal actually does: digs, dives, hunts, builds, hides, hauls.
+- Never write vague summary lines such as "marked a turning point", "played a crucial role", "paved the way", "highlighting", "underscores", "a testament to", "stands as", "boasts", "a haven for", "nature's wonder", "fascinating creature", "breathtaking", "stunning", "vibrant", "rich tapestry". Never use the words: delve, tapestry, testament, realm, pivotal, crucial, moreover, furthermore, additionally, notably, ultimately; never write "it's worth noting", "in conclusion", "not just ... but", "Here's the thing", "fun fact".
+- No lists of three adjectives or three parallel clauses. No moral, no summary, no lesson, no sales pitch.
 - 3 to 6 paragraphs of UNEVEN length, separated by a blank line (write \\n\\n inside the JSON string). One paragraph may be one short sentence.
-- Ending: ONE of these, never two: a blunt last line, a small joke, or one short question. Never two questions in the text.
+- Ending: ONE of these, never two: a blunt last line, a small joke, or one short question. Never two questions in the text. Never ask people to like, share, comment, tag or follow.
+- Never fake first-hand experience: no "I saw", no invented quotes from scientists, rangers or visitors. You may have opinions about the facts.
 - Facts: keep every number, unit and name exactly as in the SOURCE TEXT. Own words: never copy six words in a row from the SOURCE TEXT.
 - Plain text only. No em dashes, no emojis, no markdown, no hashtags inside the text.
 
@@ -325,8 +327,87 @@ _REASONING_MODELS = set()   # models whose catalogue entry supports a reasoning 
 _NO_REASON_PARAM = set()   # models that rejected that parameter
 
 
+# ---- Cloudflare Workers AI for the TEXT too (writer, checker, human-voice editor): same free 10,000 neurons a day as the pictures
+CF_TEXT_MODEL = os.environ.get("CF_TEXT_MODEL", "").strip() or "@cf/google/gemma-4-26b-a4b-it"
+CF_CHECKER_MODEL = os.environ.get("CF_CHECKER_MODEL", "").strip() or "@cf/qwen/qwen3-30b-a3b-fp8"
+CF_TEXT = os.environ.get("CF_TEXT", "1").strip() == "1" and bool(CF_ACCOUNT_ID and CF_API_TOKEN)
+
+# neurons per million tokens (input, output) from the Workers AI pricing page; used only for the usage estimate in the log
+CF_RATES = {
+    "@cf/google/gemma-4-26b-a4b-it": (9091, 27273),
+    "@cf/qwen/qwen3-30b-a3b-fp8": (4625, 30475),
+    "@cf/meta/llama-3.1-8b-instruct-fp8-fast": (4119, 34868),
+    "@cf/openai/gpt-oss-20b": (18182, 27273),
+    "@cf/openai/gpt-oss-120b": (31818, 68182),
+}
+_NEURONS = {"text": 0.0, "image": 0.0, "calls": 0}
+_CF_KWARGS_REJECTED = [False]
+
+
+def cf_call(messages, model, temperature=0.3, max_tokens=800):
+    """One Workers AI chat request through the OpenAI-compatible endpoint."""
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
+    body = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+    if not _CF_KWARGS_REJECTED[0]:
+        body["chat_template_kwargs"] = {"enable_thinking": False}  # we want the answer, not paid hidden thinking
+    last = None
+    for _ in range(2):
+        try:
+            r = requests.post(url, headers={"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"},
+                              json=body, timeout=150)
+        except requests.RequestException as e:
+            raise ModelBusy(f"{model} network error: {e}")
+        text = r.text[:300]
+        low = text.lower()
+        if r.status_code == 200:
+            try:
+                data = r.json()
+            except ValueError:
+                raise RuntimeError(f"model rejected the request: not JSON: {text[:120]}")
+            if isinstance(data, dict) and isinstance(data.get("result"), dict) and "choices" in data["result"]:
+                data = data["result"]
+            ch = (data.get("choices") or [{}])[0] if isinstance(data, dict) else {}
+            msg = ch.get("message") or {}
+            content = msg.get("content") or ""
+            usage = data.get("usage") or {} if isinstance(data, dict) else {}
+            pt = usage.get("prompt_tokens") or sum(len(str(m.get("content", ""))) for m in messages) // 4
+            ct = usage.get("completion_tokens") or len(content) // 4
+            rin, rout = CF_RATES.get(model, (9091, 27273))
+            n = pt * rin / 1e6 + ct * rout / 1e6
+            _NEURONS["text"] += n
+            _NEURONS["calls"] += 1
+            log(f"[cloudflare] {model} ok ({pt}+{ct} tokens, about {n:.0f} neurons)")
+            if not content.strip():
+                if ch.get("finish_reason") == "length":
+                    raise RuntimeError(f"model rejected: {model} spent the whole {max_tokens}-token limit on hidden reasoning")
+                content = msg.get("reasoning_content") or msg.get("reasoning") or ""
+                if not content.strip():
+                    raise RuntimeError(f"model rejected: {model} returned an empty answer")
+            return content
+        last = f"HTTP {r.status_code}: {text[:200]}"
+        log(f"[cloudflare] {model} failed: {last}")
+        if r.status_code == 429 or "neurons" in low or "daily free allocation" in low or "4006" in low:
+            if "neurons" in low or "allocation" in low or "4006" in low:
+                _BUSY[model] = time.time() + 86400
+                raise ModelBusy(f"{model}: Workers AI daily free allocation used up")
+            _BUSY[model] = time.time() + 120
+            raise ModelBusy(f"{model} is rate limited ({last[:90]})")
+        if r.status_code in (500, 502, 503, 504):
+            _BUSY[model] = time.time() + 300
+            raise ModelBusy(f"{model} is busy ({last[:90]})")
+        if r.status_code == 400 and "chat_template_kwargs" in body and ("chat_template" in low or "enable_thinking" in low or "unknown" in low or "extra" in low):
+            _CF_KWARGS_REJECTED[0] = True
+            body.pop("chat_template_kwargs", None)
+            log("[cloudflare] the thinking switch was rejected, retrying without it")
+            continue
+        raise RuntimeError(f"model rejected the request: {last}")
+    raise RuntimeError(f"model rejected the request: {last}")
+
+
 def or_call(messages, model, temperature=0.3, max_tokens=800, plugins=None):
     """One OpenRouter request. Starts at the next key in the rotation and moves on if a key is out of credit."""
+    if model.startswith("@cf/"):
+        return cf_call(messages, model, temperature, max_tokens)
     if not OR_KEYS:
         raise RuntimeError("no OpenRouter keys configured (secret OPENROUTER_API_KEYS)")
     usable = keys_usable()
@@ -518,15 +599,19 @@ def _demote(model, seconds):
 
 def setup_models():
     global WRITER_MODELS, CHECKER_MODELS, QA_MODELS
-    ranked, vision = discover_models()
-    ranked = [m for m in ranked if not _demoted(m)]
+    ranked, vision = ([], [])
+    if OR_KEYS:
+        ranked, vision = discover_models()
+        ranked = [m for m in ranked if not _demoted(m)]
     paid = _models("PAID_FALLBACK_MODEL", "")  # optional: only used if every free model fails
+    cf_w = [CF_TEXT_MODEL] if CF_TEXT else []
+    cf_c = [CF_CHECKER_MODEL] if CF_TEXT else []
     if not WRITER_MODELS:
-        WRITER_MODELS = list(dict.fromkeys(ranked[:6] + paid))
+        WRITER_MODELS = list(dict.fromkeys(cf_w + ranked[:6] + paid))
     if not CHECKER_MODELS:
         fam = _family(ranked[0]) if ranked else ""
         others = [m for m in ranked if _family(m) != fam][:4]
-        CHECKER_MODELS = list(dict.fromkeys((others or ranked[:4]) + ranked[:2] + paid))
+        CHECKER_MODELS = list(dict.fromkeys(cf_c + (others or ranked[:4]) + ranked[:2] + paid))
     if not QA_MODELS:
         QA_MODELS = [m for m in vision if not _demoted(m)][:3]
     log("writer models:", WRITER_MODELS[:3], "| checker models:", CHECKER_MODELS[:3], "| image QA models:", QA_MODELS[:2])
@@ -890,7 +975,14 @@ def ensure_highlight(lines):
     if any("[" in l for l in lines):
         return lines
     pat = re.compile(r"(\d[\d,\.]*\s?(?:KM/H|MPH|KG|KILOGRAMS?|TONNES?|TONS?|KM|KILOMETRES?|KILOMETERS?|METRES?|METERS?|CM|CENTIMETRES?|MM|MILES?|FEET|FT|%|YEARS?|HOURS?|MINUTES?|DAYS?|WEEKS?|MONTHS?|EGGS?|HEARTS?|LEGS?|TEETH)?)", re.I)
-    return [pat.sub(lambda m: f"[{m.group(1).strip()}]" + (" " if m.group(1).endswith(" ") else ""), l) for l in lines]
+    out = [pat.sub(lambda m: f"[{m.group(1).strip()}]" + (" " if m.group(1).endswith(" ") else ""), l) for l in lines]
+    if any("[" in l for l in out):
+        return out
+    words = re.findall(r"[A-Za-z']{4,}", out[-1])   # no number in the hook: colour its longest word instead
+    if words:
+        w = max(words, key=len)
+        out[-1] = out[-1].replace(w, f"[{w}]", 1)
+    return out
 
 
 def _runs(line):
@@ -1436,6 +1528,7 @@ def _cf_candidate(post, variant):
                         raw = base64.b64decode(b64)
                 if raw:
                     img = Image.open(io.BytesIO(raw)).convert("RGB")
+                    _NEURONS["image"] += math.ceil(img.size[0] / 512) * math.ceil(img.size[1] / 512) * 4.8 + CF_STEPS * 9.6   # flux-1-schnell price estimate
                     log(f"image candidate ok (Cloudflare {CF_MODEL}, {img.size[0]}x{img.size[1]}, try {i + 1})")
                     return ImageOps.fit(img, (W, H), method=Image.LANCZOS, centering=(0.5, 0.4)), False
             last = f"HTTP {r.status_code} {r.text[:200]}"
@@ -1623,13 +1716,44 @@ def fallback_background():
     return base
 
 
-def load_font(size):
-    path = FONT_PATH if FONT_PATH.exists() else FALLBACK_FONT
+FONT_DIR = HERE / "fonts"
+
+# One look per style: font, text colour, keyword colour, shadow kind (hard 3D drop / glow / outline), bottom tint,
+# alignment and subhook design. Every post gets a different one (never one of the last 4 used).
+STYLES = [
+    {"name": "classic", "font": "Anton-Regular.ttf",        "text": (244, 244, 240), "accent": (214, 70, 62),   "shadow": ("hard", (0, 0, 0)),       "tint": (0, 0, 0),    "align": "center", "sub": "line", "lh": 1.08, "k": 1.00},
+    {"name": "gold",    "font": "AbrilFatface-Regular.ttf", "text": (250, 240, 214), "accent": (232, 190, 105), "shadow": ("hard", (62, 30, 6)),     "tint": (22, 10, 2),  "align": "center", "sub": "line", "lh": 1.12, "k": 0.92},
+    {"name": "ice",     "font": "BebasNeue-Regular.ttf",    "text": (244, 246, 248), "accent": (134, 196, 226), "shadow": ("glow", (28, 62, 120)),   "tint": (2, 8, 26),   "align": "left",   "sub": "chip", "lh": 1.02, "k": 1.14},
+    {"name": "sun",     "font": "ArchivoBlack-Regular.ttf", "text": (244, 224, 140), "accent": (244, 244, 240), "shadow": ("hard", (0, 0, 0)),       "tint": (0, 0, 0),    "align": "center", "sub": "line", "lh": 1.10, "k": 0.78},
+    {"name": "pink",    "font": "Poppins-ExtraBold.ttf",    "text": (244, 244, 240), "accent": (232, 118, 156), "shadow": ("hard", (74, 16, 92)),    "tint": (14, 4, 22),  "align": "left",   "sub": "chip", "lh": 1.12, "k": 0.82},
+    {"name": "lime",    "font": "Staatliches-Regular.ttf",  "text": (244, 244, 240), "accent": (190, 224, 120), "shadow": ("outline", (6, 40, 20)),  "tint": (2, 18, 8),   "align": "center", "sub": "line", "lh": 1.04, "k": 1.14},
+    {"name": "ember",   "font": "RussoOne-Regular.ttf",     "text": (244, 244, 240), "accent": (236, 156, 84),  "shadow": ("hard", (96, 14, 10)),    "tint": (20, 4, 2),   "align": "left",   "sub": "line", "lh": 1.10, "k": 0.86},
+    {"name": "lagoon",  "font": "Righteous-Regular.ttf",    "text": (232, 242, 248), "accent": (122, 208, 188), "shadow": ("glow", (10, 90, 90)),    "tint": (2, 16, 20),  "align": "center", "sub": "chip", "lh": 1.10, "k": 0.92},
+    {"name": "coral",   "font": "PassionOne-Bold.ttf",      "text": (250, 244, 236), "accent": (238, 128, 108), "shadow": ("hard", (90, 20, 30)),    "tint": (18, 6, 8),   "align": "center", "sub": "line", "lh": 1.04, "k": 1.14},
+    {"name": "slab",    "font": "AlfaSlabOne-Regular.ttf",  "text": (250, 242, 222), "accent": (232, 182, 88),  "shadow": ("outline", (40, 22, 8)),  "tint": (14, 8, 2),   "align": "left",   "sub": "line", "lh": 1.10, "k": 0.82},
+]
+RECENT_STYLES = []   # style names of the latest posts (filled from history.json)
+_STYLE_USED = [""]
+
+
+def pick_style():
+    fresh = [s for s in STYLES if s["name"] not in RECENT_STYLES[-4:]] or STYLES
+    return random.choice(fresh)
+
+
+def load_font(size, name=None):
+    path = FONT_DIR / (name or "Anton-Regular.ttf")
+    if not path.exists():
+        path = FONT_PATH if FONT_PATH.exists() else FALLBACK_FONT
     return ImageFont.truetype(str(path), size)
 
 
-def parse_segments(line):
-    return [(t, RED if red else WHITE) for t, red in _runs(line) if t]
+def _ascii(s):
+    return unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("ascii")
+
+
+def parse_segments(line, st):
+    return [(t, st["accent"] if red else st["text"]) for t, red in _runs(line) if t]
 
 
 def _smooth(x):
@@ -1637,18 +1761,65 @@ def _smooth(x):
     return x * x * (3 - 2 * x)
 
 
-def _spaced(draw, cx, y, text, font, fill, spacing=3, shadow=True):
-    total = sum(font.getlength(c) + spacing for c in text) - spacing
-    x = cx - total / 2
+def _spaced(draw, x0, y, text, font, fill, spacing=3, shadow=True):
+    x = x0
     for c in text:
         if shadow:
             draw.text((x + 2, y + 3), c, font=font, fill=(0, 0, 0))
         draw.text((x, y), c, font=font, fill=fill)
         x += font.getlength(c) + spacing
+    return x
 
 
-def overlay_text(photo, headline_lines, subhook):
-    """Full-bleed photo, dark gradient at the bottom, big headline with red keywords, small subline, watermarks."""
+def _spaced_width(text, font, spacing=3):
+    return sum(font.getlength(c) + spacing for c in text) - spacing
+
+
+def _headline_layers(img, items, font, st):
+    """glow / 3D drop shadow / outline behind the text, then the text itself."""
+    kind, scol = st["shadow"]
+    size = font.size
+    if kind == "glow":
+        mask = Image.new("L", (W, H), 0)
+        md = ImageDraw.Draw(mask)
+        for x, y, t, _ in items:
+            md.text((x, y), t, font=font, fill=255)
+        mask = mask.filter(ImageFilter.GaussianBlur(max(16, size // 5))).point(lambda v: min(255, int(v * 0.8)))
+        img.paste(Image.new("RGB", (W, H), scol), (0, 0), mask)
+    d = ImageDraw.Draw(img)
+    for x, y, t, _ in items:
+        d.text((x + 2, y + 4), t, font=font, fill=(0, 0, 0))
+    if kind == "hard":
+        for i in range(1, max(4, size // 18) + 1):
+            for x, y, t, _ in items:
+                d.text((x + i * 0.7, y + i), t, font=font, fill=scol)
+    stroke = max(3, size // 26) if kind == "outline" else 0
+    for x, y, t, c in items:
+        if stroke:
+            d.text((x, y), t, font=font, fill=c, stroke_width=stroke, stroke_fill=scol)
+        else:
+            d.text((x, y), t, font=font, fill=c)
+
+
+def _fit_headline(lines, st, fname, sub, left):
+    """Biggest font size at which the headline (and the subhook) still fits the text area."""
+    max_w, max_h = W - 144, int(H * 0.31)
+    size = min(int(112 * st["k"]), 140)
+    while True:
+        font = load_font(size, fname)
+        lh = int(size * st["lh"])
+        widths = [sum(font.getlength(t) for t, _ in segs) for segs in lines]
+        extra = (int(size * 0.62) if sub and st["sub"] == "line" else 0) + (74 if sub and st["sub"] == "chip" else 0) + (26 if left else 0)
+        total = lh * len(lines) + extra
+        if (max(widths) <= max_w and total <= max_h) or size <= 40:
+            return size, font, lh, widths, total
+        size -= 4
+
+
+def overlay_text(photo, headline_lines, subhook, style=None):
+    """Full-bleed photo, tinted gradient at the bottom, big hook in this post's own font and colours, subhook, watermarks."""
+    st = style or pick_style()
+    _STYLE_USED[0] = st["name"]
     img = photo.convert("RGB")
     if img.size != (W, H):
         img = ImageOps.fit(img, (W, H), method=Image.LANCZOS)
@@ -1657,54 +1828,74 @@ def overlay_text(photo, headline_lines, subhook):
     px = grad.load()
     for y in range(H):
         f = y / H
-        if f < 0.50:
+        if f < 0.48:
             a = 0.0
         elif f < 0.72:
-            a = 0.90 * _smooth((f - 0.50) / 0.22)
+            a = 0.90 * _smooth((f - 0.48) / 0.24)
         else:
             a = 0.90 + 0.08 * ((f - 0.72) / 0.28)
         px[0, y] = int(255 * a)
-    img.paste(Image.new("RGB", (W, H), (0, 0, 0)), (0, 0), grad.resize((W, H)))
+    img.paste(Image.new("RGB", (W, H), st["tint"]), (0, 0), grad.resize((W, H)))
 
-    lines = [parse_segments(l.upper()) for l in headline_lines if l.strip()]
-    max_w, max_h = W - 120, int(H * 0.29)
-    size = 108
-    while size > 40:
-        font = load_font(size)
-        lh = int(size * 1.08)
-        widths = [sum(font.getlength(t) for t, _ in segs) for segs in lines]
-        total = lh * len(lines) + (int(size * 0.82) if subhook.strip() else 0)
-        if max(widths) <= max_w and total <= max_h:
-            break
-        size -= 4
+    left = st["align"] == "left"
+    margin = 72
+    sub = _ascii(subhook).upper().strip()
+    lines = [parse_segments(_ascii(l).upper(), st) for l in headline_lines if l.strip()]
+    size, font, lh, widths, total = _fit_headline(lines, st, st["font"], sub, left)
+    if size < 60 and st["font"] != "Anton-Regular.ttf":   # a wide font would make this headline too small: keep the colours, use the condensed font
+        size, font, lh, widths, total = _fit_headline(lines, st, "Anton-Regular.ttf", sub, left)
 
     draw = ImageDraw.Draw(img)
     y = H - 104 - total
+    if left:  # short accent bar above the headline
+        draw.rectangle([margin, y, margin + 120, y + 10], fill=st["accent"])
+        y += 26
+    if sub and st["sub"] == "chip":
+        cf = load_font(34, "BebasNeue-Regular.ttf")
+        cw = _spaced_width(sub, cf, 4) + 40
+        cx = margin if left else (W - cw) / 2
+        lum = 0.3 * st["accent"][0] + 0.59 * st["accent"][1] + 0.11 * st["accent"][2]
+        draw.rounded_rectangle([cx, y, cx + cw, y + 52], radius=10, fill=st["accent"])
+        _spaced(draw, cx + 20, y + 6, sub, cf, (0, 0, 0) if lum > 135 else (255, 255, 255), spacing=4, shadow=False)
+        y += 74
+
+    items = []
     for segs, width in zip(lines, widths):
-        x = (W - width) / 2
+        x = margin if left else (W - width) / 2
         for text, color in segs:
-            draw.text((x + 3, y + 4), text, font=font, fill=(0, 0, 0))
-            draw.text((x, y), text, font=font, fill=color)
+            items.append((x, y, text, color))
             x += font.getlength(text)
         y += lh
-    sub = subhook.upper().strip()
-    if sub:
-        _spaced(draw, W / 2, y + int(size * 0.24), sub, load_font(max(26, int(size * 0.34))), WHITE, spacing=3)
+    _headline_layers(img, items, font, st)
+
+    draw = ImageDraw.Draw(img)
+    if sub and st["sub"] == "line":
+        sf = load_font(max(30, int(size * 0.36)), "BebasNeue-Regular.ttf")
+        sw = _spaced_width(sub, sf, 5)
+        bar = 56
+        total_w = sw + 2 * (bar + 18) if not left else bar + 18 + sw
+        x0 = margin if left else (W - total_w) / 2
+        yy = y + int(size * 0.17)
+        mid = yy + sf.size * 0.55
+        draw.rectangle([x0, mid - 2, x0 + bar, mid + 2], fill=st["accent"])
+        xt = _spaced(draw, x0 + bar + 18, yy, sub, sf, st["text"], spacing=5)
+        if not left:
+            draw.rectangle([xt + 13, mid - 2, xt + 13 + bar, mid + 2], fill=st["accent"])
 
     # watermarks: page name (bottom-left) and the AI label (bottom-right)
     if PAGE_NAME:
-        wf = load_font(24)
-        draw.ellipse([30, H - 46, 46, H - 30], fill=GOLD)
+        wf = load_font(26, "BebasNeue-Regular.ttf")
+        draw.ellipse([30, H - 46, 46, H - 30], fill=st["accent"])
         x = 58
         for c in PAGE_NAME.upper():
-            draw.text((x + 1, H - 46), c, font=wf, fill=(0, 0, 0))
-            draw.text((x, H - 47), c, font=wf, fill=(238, 238, 238))
-            x += wf.getlength(c) + 2
+            draw.text((x + 1, H - 48), c, font=wf, fill=(0, 0, 0))
+            draw.text((x, H - 49), c, font=wf, fill=(238, 238, 238))
+            x += wf.getlength(c) + 3
     if WATERMARK:
-        af = load_font(20)
+        af = load_font(24, "BebasNeue-Regular.ttf")
         label = WATERMARK.upper()
-        aw = sum(af.getlength(c) + 1 for c in label)
-        draw.text((W - aw - 30, H - 44), label, font=af, fill=(205, 205, 205))
+        aw = _spaced_width(label, af, 2)
+        _spaced(draw, W - aw - 30, H - 48, label, af, (205, 205, 205), spacing=2, shadow=False)
     return img
 
 
@@ -1766,7 +1957,7 @@ def facebook_due():
 # ----------------------------------------------------------------- main
 def main():
     missing = [n for n, v in (("POLLINATIONS_API_KEY (or CF_ACCOUNT_ID and CF_API_TOKEN)", KEY or (CF_ACCOUNT_ID and CF_API_TOKEN)), ("TELEGRAM_BOT_TOKEN", TG_TOKEN), ("TELEGRAM_CHAT_ID", TG_CHAT),
-                              ("OPENROUTER_API_KEYS", ",".join(OR_KEYS))) if not v]
+                              ("OPENROUTER_API_KEYS", ",".join(OR_KEYS) or ("-" if CF_TEXT else ""))) if not v]
     if missing:
         sys.exit(f"missing env vars: {', '.join(missing)}")
 
@@ -1776,6 +1967,9 @@ def main():
         run()
     finally:
         log(f"OpenRouter keys usable now: {len(keys_usable())}/{len(OR_KEYS)}")
+        tot = _NEURONS["text"] + _NEURONS["image"]
+        log(f"WORKERS AI USAGE THIS RUN (estimate): text {_NEURONS['text']:.0f} + images {_NEURONS['image']:.0f} = {tot:.0f} neurons "
+            f"({_NEURONS['calls']} text calls). Daily free limit 10000. Check the real number in the Cloudflare dashboard.")
         save_keystate()
 
 
@@ -1783,6 +1977,7 @@ def run():
     history = load_history()
     recent = [h["topic"] for h in history[-40:]]
     used = {h.get("source") for h in history if h.get("source")}
+    RECENT_STYLES[:] = [h.get("style") for h in history[-6:] if h.get("style")]
     try:
         post = build_post(recent, used)  # always returns something unless Wikipedia itself is unreachable
     except RuntimeError as e:
@@ -1819,6 +2014,7 @@ def run():
                 "topic": post["topic"],
                 "source": post.get("source_title"),
                 "habitat": post.get("habitat"),
+                "style": _STYLE_USED[0],
             }
         )
         save_history(history)
