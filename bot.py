@@ -108,6 +108,7 @@ SOURCE-GROUNDING RULES (absolute):
 - You receive SOURCE TEXT from Wikipedia. Use ONLY facts that are stated in the SOURCE TEXT. Never add a number, name, cause or "first/only/largest/fastest" claim that the SOURCE TEXT does not state. Use no outside knowledge for facts.
 - Write every number and unit EXACTLY as it appears in the SOURCE TEXT (if the source says "20 centimetres", write "20 centimetres"). Do no arithmetic and no conversions: never restate a measurement in another unit (not "24 in" as "two feet") and never add "nearly", "almost", "roughly" or "about" to a number unless the SOURCE TEXT uses that word.
 - Every proper name (species, place, scientist) in your caption must appear in the SOURCE TEXT.
+- Write every number as DIGITS (25.2 metres, 2017, 4.5 tonnes). Never spell numbers out in words (not "twenty-five point two"); only "one" and "two" may be words in ordinary phrases.
 - Pick the single most surprising fact with a number that the SOURCE TEXT clearly states and that is about the animal's body, senses, behaviour, life cycle, habitat or survival. Return {"skip": true, "reason": "..."} only if the article contains no such fact at all.
 - "evidence": 3 to 6 objects {"claim": "...", "quote": "..."} where quote is copied WORD FOR WORD from the SOURCE TEXT (6 to 30 words). Together they must cover EVERY number and name used in the headline and in the REVEAL paragraph.
 - Never put citation markers like [1] or URLs in any text field.
@@ -687,6 +688,25 @@ SKIP_CATEGORY = re.compile(
     r"conservation|organisations|organizations|museums|zoos|aquariums|sports|mascots|films|television|literature|games",
     re.I,
 )
+NON_ANIMAL_TITLE = re.compile(
+    r"\((?:[a-z]+ )?(?:whale|dolphin|dog|cat|horse|elephant|gorilla|chimpanzee|bear|lion|tiger|seal|orca|parrot|crow|cow|pig|"
+    r"sheep|goat|bird|fish|shark|turtle|tortoise|snake|monkey|ape|bull|ox|mule|donkey|camel|owl|eagle|penguin|otter|walrus)\)$"   # one famous individual animal
+    r"|declaration|treaty|convention|\bact\b|society|foundation|project\b|institute|museum|\bzoo\b|aquarium|sanctuary|reserve|national park|"
+    r"ology$|ologist|terminology|anatomy|pollination|taxonomy|classification|skeleton|tourism|\bdiet\b",
+    re.I,
+)
+TAXON_WORDS = re.compile(r"\b(species|genus|subspecies|family|subfamily|order|suborder|clade|superfamily|tribe)\b", re.I)
+SCI_NAME = re.compile(r"\([A-Z][a-z]+ [a-z]+(?: [a-z]+)?[,;)]")
+
+
+def looks_like_animal(title, text):
+    """A category walk can land on laws, museums, individual animals or biology terms. Keep real animal species/groups only."""
+    if NON_ANIMAL_TITLE.search(title):
+        return False
+    lead = text[:900]
+    return bool(TAXON_WORDS.search(lead) or SCI_NAME.search(lead))
+
+
 _CAT_CACHE = {}
 
 
@@ -701,7 +721,8 @@ def _category_members(cat):
             if not SKIP_CATEGORY.search(t):
                 subs.append(t)
         elif m.get("ns") == 0:
-            if not re.match(r"(List of|Timeline of|Index of|Outline of)", t) and not BANNED_TITLE.search(t) and not SENSITIVE_TITLE.search(t):
+            if not re.match(r"(List of|Timeline of|Index of|Outline of)", t) and not BANNED_TITLE.search(t) and not SENSITIVE_TITLE.search(t) \
+                    and not NON_ANIMAL_TITLE.search(t):
                 pages.append(t)
     _CAT_CACHE[cat] = (pages, subs)
     return pages, subs
@@ -743,11 +764,13 @@ def pick_source(used, level=0):
             continue
         _TRIED.add(t)
         text = wiki_extract(t)
-        if len(text) >= 1500:
+        need = 1500 if kind == "curated" else 3000   # thin articles give thin posts
+        if len(text) >= need and (kind == "curated" or looks_like_animal(t, text)):
             log(f"article {t!r} accepted ({kind}, {len(text)} characters)")
             _LAST_SOURCE[:] = [t, text]
             return t, text
-        log(f"skipped {t!r} ({kind}): not found or too short")
+        why = "not found or too short" if len(text) < need else "not an animal species/group article"
+        log(f"skipped {t!r} ({kind}): {why}")
     cat = random.randrange(len(CATEGORIES))
     query = random.choice(CATEGORY_KEYWORDS[cat])
     log("backup search:", query)
@@ -964,6 +987,36 @@ def rewrap_headline(lines, width=30):
     return rendered
 
 
+SPELLED_NUM = re.compile(
+    r"\b(?:(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:[- ](?:one|two|three|four|five|six|seven|eight|nine))?"
+    r"|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|hundred|thousand|million|billion)\b", re.I)
+SPELLED_POINT = re.compile(r"\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten) point (?:zero|one|two|three|four|five|six|seven|eight|nine)\b", re.I)
+
+
+def has_spelled_numbers(text):
+    """Numbers written as words slip past the digit check, so a caption full of them is not allowed."""
+    return bool(SPELLED_POINT.search(text)) or len(SPELLED_NUM.findall(text)) >= 2
+
+
+def ensure_paragraphs(cap):
+    """A wall of text becomes 3 to 4 paragraphs of uneven length."""
+    cap = cap.strip()
+    if "\n\n" in cap:
+        return cap
+    cap = cap.replace("\n", " ")
+    sents = re.split(r"(?<=[.!?])\s+", cap)
+    n = len(sents)
+    if n < 4:
+        return cap
+    cuts = sorted({max(1, round(n * f)) for f in (0.2, 0.5, 0.8)})
+    cuts = [c for c in cuts if c < n]
+    parts, last = [], 0
+    for c in cuts + [n]:
+        parts.append(" ".join(sents[last:c]))
+        last = c
+    return "\n\n".join(x for x in parts if x)
+
+
 def validate_post(post, level=0):
     """level 0 = normal, 1 = relaxed, 2 = minimal. Formatting is always repaired; only level 0 is picky."""
     lines = post.get("headline_lines")
@@ -992,7 +1045,10 @@ def validate_post(post, level=0):
     cap = re.sub(r"\s?\[\d{1,2}\]", "", post["caption"])
     cap = re.sub(r"\s*[\u2014\u2013]\s*", ", ", cap)  # no em/en dashes (AI tell)
     cap = re.sub(r"[*_#`]+", "", cap).strip()
+    cap = ensure_paragraphs(cap)
     post["caption"] = cap
+    if level < 2 and has_spelled_numbers(cap):
+        return "numbers spelled out in words (must be digits)"
     post["headline_lines"] = ensure_highlight(lines)
     return None
 
@@ -1191,6 +1247,35 @@ def emergency_post(title, source):
     }
 
 
+EXPAND_SYSTEM = """You extend short social-media captions about animals.
+Rewrite the CAPTION so it is 170-230 words. Use ONLY facts that the SOURCE TEXT states: add 3 to 5 more concrete details (other numbers, names, behaviours, places) from it.
+Keep every number and unit exactly as in the SOURCE TEXT and the CAPTION. Write numbers as digits (25.2 metres, 2017), never spelled out in words. Never convert a unit and never add "nearly", "almost" or "roughly" to a number.
+Keep the voice: plain American English, one sharp nature nerd telling a friend, short and long sentences mixed, contractions, no AI cliches (delve, tapestry, testament, pivotal, crucial, moreover, furthermore, "a turning point"), no em dashes, no emojis, no hashtags.
+4 to 6 paragraphs of uneven length, separated by a blank line (write \\n\\n inside the JSON string). End with ONE blunt line, a small joke or one short question.
+Return ONLY JSON: {"caption": "..."}"""
+
+
+def expand_caption(post, source, minimum):
+    """Free models often write 70 to 100 words although 150 were asked. One extra call usually fixes it."""
+    cap = str(post.get("caption", ""))
+    words = len(cap.split())
+    if words < 40 or words >= minimum:
+        return False
+    try:
+        out = chat_json(EXPAND_SYSTEM, f"SOURCE TEXT:\n{source[:6000]}\n\nCAPTION:\n{cap}",
+                        list(WRITER_MODELS), 0.8, tries=1, max_tokens=2500)
+    except Exception as e:  # noqa: BLE001
+        log("caption expander unavailable:", str(e)[:100])
+        return False
+    new = str(out.get("caption", "")).strip()
+    if len(new.split()) < minimum or numbers_in(new, True) - numbers_in(source, False) or has_spelled_numbers(new):
+        log("caption expansion dropped (still short, new numbers, or numbers spelled out)")
+        return False
+    log(f"caption expanded: {words} -> {len(new.split())} words")
+    post["caption"] = new
+    return True
+
+
 def build_post(recent, used):
     """Tries hard, then softer, then softest, then a plain post: a run always ends with something worth publishing."""
     deadline = time.time() + RUN_BUDGET_MIN * 60
@@ -1213,6 +1298,9 @@ def build_post(recent, used):
             if not post.get("topic"):
                 post["topic"] = title
             problem = validate_post(post, level)
+            if problem and problem.startswith("caption word count"):
+                if expand_caption(post, source, {0: 150, 1: 110}.get(level, 60)):
+                    problem = validate_post(post, level)
             if problem:
                 log("rejected:", problem)
                 continue
@@ -1503,10 +1591,8 @@ def generate_image(post):
             return _finish(img, up, mode)
         verdict = None if qa_failures >= 2 else vision_check(img, story)
         if verdict is None:
-            if qa_failures < 2:
-                qa_failures += 1
-                log(f"image QA unavailable for candidate #{n + 1}, kept as unrated")
-            score = 5.0
+            log(f"image QA unavailable for candidate #{n + 1}: using it unrated (no point generating more)")
+            return _finish(img, up, mode)
         else:
             on_topic = verdict.get("matches_story") is not False
             ok = bool(verdict.get("ok")) and on_topic
