@@ -35,6 +35,9 @@ jobs:
         env:
           # images: Pollinations
           POLLINATIONS_API_KEY: ${{ secrets.POLLINATIONS_API_KEY }}
+          # free image generation (Cloudflare Workers AI); Pollinations above is the backup
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           IMAGE_MODEL: ${{ vars.IMAGE_MODEL || 'flux,lykon/dreamshaper-8-lcm' }}
           # text (writer, checker, image QA): pool of OpenRouter keys, one per line or comma separated
           OPENROUTER_API_KEYS: ${{ secrets.OPENROUTER_API_KEYS }}
@@ -67,4 +70,3 @@ jobs:
           else
             echo "No changes to commit."
           fi
-
